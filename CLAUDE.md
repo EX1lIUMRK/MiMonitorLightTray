@@ -7,7 +7,7 @@
 
 ## 1. 工程基本信息
 
-- **语言**：Python 3.10+（CI matrix = 3.10 / 3.11 / 3.12，EXE 打包用 3.10，与本地 venv 保持一致）
+- **语言**：Python 3.12+（CI matrix = 3.12 / 3.13，EXE 打包用 3.12）。3.10 仅因旧 CI 要和本地 venv 体积一致而用过，官方 3.10.11 自带已停止维护的 OpenSSL 1.1.1t，不再用于打包。
 - **入口**：`mi_monitor_light_tray.__main__:main()` / `scripts/run_app.py`（PyInstaller 打包入口）
 - **打包**：PyInstaller 单文件 + `--noconsole`（Windows 托盘程序不能有黑窗）
 - **配置位置**：`pyproject.toml` 的 `[project]` 段（版本号、依赖、唯一真源）

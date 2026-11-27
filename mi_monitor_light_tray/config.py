@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .secret_store import get_cipher, restrict_private_file
+
 log = logging.getLogger(__name__)
 
 
@@ -90,6 +92,17 @@ class AppConfig:
     widget: WidgetConfig = field(default_factory=WidgetConfig)
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     auto_check_update: bool = True  # 启动时自动检查更新
+    language: str = "auto"  # auto / en / ru / zh; old configs follow Windows
+
+    def __post_init__(self) -> None:
+        # Not serialized. Plaintext tokens live only in memory.
+        self._sealed_fallback: dict[str, str] = {}
+        self._secrets_need_migration = False
+        self.tokens_need_reentry = False
+
+    @property
+    def secrets_need_migration(self) -> bool:
+        return self._secrets_need_migration
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "AppConfig":
@@ -113,15 +126,37 @@ class AppConfig:
                 data["devices"] = [single_dev]
                 log.info("Migrated single-device config to multi-device format")
 
-        # Load devices list
+        # Load devices list. Tokens may be legacy plaintext or DPAPI blobs.
         devices_data = data.get("devices", [])
         dev_known = {f for f in DeviceConfig.__dataclass_fields__}
+        cipher = get_cipher()
+        sealed_fallback: dict[str, str] = {}
+        need_migration = False
+        need_reentry = False
         devices = []
         for d in devices_data:
+            if not isinstance(d, dict):
+                continue
             # Ensure each device has an id
             if "id" not in d or not d["id"]:
                 import uuid
                 d["id"] = f"temp_{uuid.uuid4().hex[:8]}"
+            stored = d.get("token") or ""
+            if not isinstance(stored, str):
+                stored = ""
+            if stored and cipher.is_sealed(stored):
+                try:
+                    d["token"] = cipher.unprotect(stored)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "Could not decrypt the token for device %s",
+                        d.get("name") or d.get("id"),
+                    )
+                    d["token"] = ""
+                    sealed_fallback[d["id"]] = stored
+                    need_reentry = True
+            elif stored and cipher.protects():
+                need_migration = True
             devices.append(DeviceConfig(**{k: v for k, v in d.items() if k in dev_known}))
 
         # 加载小部件配置
@@ -137,27 +172,57 @@ class AppConfig:
         # 加载活动设备 ID
         active_device_id = data.get("active_device_id", "ALL")
 
-        return cls(
+        cfg = cls(
             devices=devices,
             active_device_id=active_device_id,
             widget=widget,
             hotkey=hotkey,
-            auto_check_update=auto_check_update
+            auto_check_update=auto_check_update,
+            language=data.get("language") if data.get("language") in ("auto", "en", "ru", "zh") else "auto",
         )
+        cfg._sealed_fallback = sealed_fallback
+        cfg._secrets_need_migration = need_migration
+        cfg.tokens_need_reentry = need_reentry
+        return cfg
 
     def save(self, path: Optional[Path] = None) -> None:
         path = path or default_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        cipher = get_cipher()
+        devices_payload = []
+        for dev in self.devices:
+            item = asdict(dev)
+            token = dev.token or ""
+            if token:
+                item["token"] = cipher.protect(token)
+                self._sealed_fallback.pop(dev.id, None)
+            elif dev.id and dev.id in self._sealed_fallback:
+                # Decrypt failed. Keep the original blob instead of wiping it.
+                item["token"] = self._sealed_fallback[dev.id]
+            else:
+                item["token"] = ""
+            devices_payload.append(item)
         payload = {
-            "devices": [asdict(d) for d in self.devices],
+            "devices": devices_payload,
             "active_device_id": self.active_device_id,
             "widget": asdict(self.widget),
             "hotkey": asdict(self.hotkey),
             "auto_check_update": self.auto_check_update,
+            "language": self.language,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if tmp.is_symlink():
+            tmp.unlink()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2))
+        restrict_private_file(tmp)
         os.replace(tmp, path)
+        restrict_private_file(path)
+        self._secrets_need_migration = False
 
 
 def default_config_path() -> Path:

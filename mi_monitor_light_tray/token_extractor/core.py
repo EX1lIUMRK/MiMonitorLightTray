@@ -297,7 +297,8 @@ class XiaomiCloudConnector:
         signature_params.append(signed_nonce)
         signature_string = "&".join(signature_params)
         return base64.b64encode(
-            hashlib.sha1(signature_string.encode("utf-8")).digest()
+            # Xiaomi cloud request signatures are SHA1 by protocol.
+            hashlib.sha1(signature_string.encode("utf-8")).digest()  # nosec
         ).decode()
 
     @staticmethod
@@ -361,9 +362,11 @@ class XiaomiCloudConnector:
         Returns:
             Base64 编码的密文
         """
-        from Crypto.Cipher import ARC4
+        # Xiaomi's cloud API encrypts these payloads with RC4. This is the
+        # protocol, not a cipher we chose for storing secrets.
+        from Crypto.Cipher import ARC4  # nosec B413
 
-        r = ARC4.new(base64.b64decode(password))
+        r = ARC4.new(base64.b64decode(password))  # nosec B304
         r.encrypt(bytes(1024))
         return base64.b64encode(r.encrypt(payload.encode())).decode()
 
@@ -378,8 +381,8 @@ class XiaomiCloudConnector:
         Returns:
             解密后的字节数据
         """
-        from Crypto.Cipher import ARC4
+        from Crypto.Cipher import ARC4  # nosec B413
 
-        r = ARC4.new(base64.b64decode(password))
+        r = ARC4.new(base64.b64decode(password))  # nosec B304
         r.encrypt(bytes(1024))
         return r.encrypt(base64.b64decode(payload))

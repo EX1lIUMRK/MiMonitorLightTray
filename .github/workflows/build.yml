@@ -8,45 +8,85 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Forks do not run Actions until the owner enables them
+# (Settings → Actions → General → Allow all actions and reusable workflows).
+# Tag releases also need Workflow permissions: Read and write.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   test:
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
+      - name: Install pinned dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install --require-hashes -r requirements/lock.txt
+          pip install --no-deps -e .
       - name: Run tests
         run: pytest -q
+      - name: Ruff
+        run: ruff check mi_monitor_light_tray tests
+      - name: Bandit
+        run: bandit -r mi_monitor_light_tray -ll -c pyproject.toml
+      - name: pip-audit
+        run: pip-audit --strict --requirement requirements/lock.txt --disable-pip --progress-spinner=off
 
   build-exe:
     needs: test
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-      - name: Install
+          python-version: "3.12"
+      - name: Install pinned dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[build]"
+          pip install --require-hashes -r requirements/lock.txt
+          pip install --no-deps -e .
       - name: Build EXE
+        env:
+          MMLT_SKIP_LOCK_INSTALL: "1"
         run: python scripts/build_exe.py
+      - name: Write SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 dist/MiMonitorLightTray.exe).Hash.ToLower()
+          Set-Content -Path dist/SHA256SUMS -Value "$hash  MiMonitorLightTray.exe" -Encoding ascii
+          $written = (Get-Content dist/SHA256SUMS -Raw).Trim()
+          if ($written -ne "$hash  MiMonitorLightTray.exe") { throw "checksum file mismatch" }
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/MiMonitorLightTray.exe
+            dist/SHA256SUMS
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MiMonitorLightTray-windows
-          path: dist/MiMonitorLightTray.exe
+          path: |
+            dist/MiMonitorLightTray.exe
+            dist/SHA256SUMS
           if-no-files-found: error
 
   release:
@@ -65,20 +105,20 @@ jobs:
         id: notes
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"  # e.g. "v1.5.1"
+          $tag = "${{ github.ref_name }}"
           $path = "release-notes/RELEASE_NOTES_$tag.md"
-          $bodyFile = ""
           if (Test-Path $path) {
-            $bodyFile = $path
-            Write-Output "body_path=$bodyFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Host "Using custom release notes: $bodyFile"
+            Write-Output "body_path=$path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Using custom release notes: $path"
           } else {
             Write-Host "No custom notes at $path, using auto-generated ones."
           }
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MiMonitorLightTray.exe
+          files: |
+            dist/MiMonitorLightTray.exe
+            dist/SHA256SUMS
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
           draft: false

@@ -15,6 +15,8 @@ the ``_Backend`` abstraction hides that difference from ``MiMonitorLight``.
 
 from __future__ import annotations
 
+from .i18n import t
+
 import logging
 import threading
 import time
@@ -376,6 +378,13 @@ class MiMonitorLight:
         self._local_write_guard = False
         self._last_error_log = 0.0
         self._discovery_in_progress = False
+        # One retry chain after a failed poll. Overlapping refreshes used to
+        # let a later timeout wipe a status that had already succeeded, then
+        # stop, so a new lamp stayed "offline" until the process was restarted.
+        self._retry_delays: tuple[float, ...] = (1.0, 3.0, 8.0, 15.0, 15.0)
+        self._retries_left = 0
+        self._retry_timer: threading.Timer | None = None
+        self._power_on_when_reachable = False
         self._color_temp_min, self._color_temp_max = self.ct_range_for(self._model)
         # Whether info() has reported a model since this session began. Until
         # then we keep probing on success in case the configured model is wrong
@@ -393,6 +402,18 @@ class MiMonitorLight:
         return self._device_id
 
     @property
+    def ip(self) -> str:
+        return self._ip
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def enable_miot_for_unknown(self) -> bool:
+        return self._enable_miot_for_unknown
+
+    @property
     def model(self) -> str:
         """Return the resolved model id (configured value or device-reported)."""
         return self._model
@@ -407,6 +428,57 @@ class MiMonitorLight:
 
     def set_listener(self, listener: Optional[StateListener]) -> None:
         self._listener = listener
+
+    def close(self) -> None:
+        """Stop reconnect attempts. Used when this lamp is replaced or removed."""
+        with self._lock:
+            self._retries_left = 0
+            self._power_on_when_reachable = False
+            timer = self._retry_timer
+            self._retry_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def ensure_connected(
+        self,
+        *,
+        power_on: bool = False,
+        delays: tuple[float, ...] | None = None,
+    ) -> LightState:
+        """Read status on the configured IP, then retry while it does not answer.
+
+        The configured address is used as-is. UDP rediscovery is a separate
+        path and only runs after a hardware device id is already known, so the
+        first save of a cloud-imported lamp is not blocked on a broadcast.
+        """
+        if delays is not None:
+            self._retry_delays = tuple(delays)
+        with self._lock:
+            if power_on:
+                self._power_on_when_reachable = True
+            self._retries_left = len(self._retry_delays)
+            timer = self._retry_timer
+            self._retry_timer = None
+        if timer is not None:
+            timer.cancel()
+        return self.refresh()
+
+    def _arm_retry(self) -> None:
+        if self._retries_left <= 0 or self._retry_timer is not None:
+            return
+        delay = self._retry_delays[len(self._retry_delays) - self._retries_left]
+        self._retries_left -= 1
+        timer = threading.Timer(delay, self._on_retry)
+        timer.daemon = True
+        self._retry_timer = timer
+        timer.start()
+
+    def _on_retry(self) -> None:
+        with self._lock:
+            self._retry_timer = None
+            if self._state.reachable or self._retries_left < 0:
+                return
+        self.refresh()
 
     def _notify(self) -> None:
         listener = self._listener
@@ -442,6 +514,8 @@ class MiMonitorLight:
             self._last_error_log = now
         self._state.reachable = False
         self._state.error = str(exc)
+        # Keep polling the saved IP. A single timeout must not be the last try.
+        self._arm_retry()
 
         # If we have a device_id and discovery isn't already running, try to find the new IP.
         if (
@@ -455,11 +529,32 @@ class MiMonitorLight:
     def _try_rediscover(self) -> None:
         self._discovery_in_progress = True
         try:
-            from .discovery import find_device_by_id
+            from .discovery import candidate_is_trusted, find_candidate_ips
 
-            new_ip = find_device_by_id(self._device_id, timeout=6.0)
-            if new_ip and new_ip != self._ip:
-                log.info("Device found at new IP: %s (was %s)", new_ip, self._ip)
+            candidates = find_candidate_ips(self._device_id, timeout=6.0)
+            for new_ip in candidates[:8]:
+                if new_ip == self._ip:
+                    continue
+                try:
+                    ok, _message, reported_id = quick_ping(new_ip, self._token, timeout=3.0)
+                except Exception:  # noqa: BLE001
+                    log.exception("Authenticated probe failed for %s", new_ip)
+                    continue
+                if not candidate_is_trusted(
+                    candidate_ip=new_ip,
+                    current_ip=self._ip,
+                    authenticated=ok,
+                    reported_device_id=reported_id,
+                    expected_device_id=self._device_id,
+                ):
+                    log.warning(
+                        "Ignoring discovered address %s for device %08x; "
+                        "authenticated check did not match",
+                        new_ip,
+                        self._device_id,
+                    )
+                    continue
+                log.info("Device authenticated at new IP %s (was %s)", new_ip, self._ip)
                 self._ip = new_ip
                 with self._lock:
                     self._device = _make_backend(
@@ -468,12 +563,11 @@ class MiMonitorLight:
                     )
                 if self._on_ip_changed:
                     self._on_ip_changed(new_ip)
-                # Retry status immediately.
                 self.refresh()
-            else:
-                log.warning("Auto-discovery did not find device %08x", self._device_id)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Auto-discovery failed: %s", exc)
+                return
+            log.warning("Auto-discovery did not authenticate device %08x", self._device_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Auto-discovery failed")
         finally:
             self._discovery_in_progress = False
 
@@ -558,6 +652,7 @@ class MiMonitorLight:
             self._model_resolved = True
 
     def refresh(self) -> LightState:
+        should_power = False
         with self._lock:
             try:
                 status = self._device.status()
@@ -565,6 +660,11 @@ class MiMonitorLight:
                 self._record_error(exc, "status")
                 self._notify()
                 return self._state
+            self._retries_left = 0
+            timer = self._retry_timer
+            self._retry_timer = None
+            if timer is not None:
+                timer.cancel()
             if self._local_write_guard:
                 # 缓存里是用户刚手动调整的值。灯可能在别处被改过，refresh 仍要
                 # 能把真实状态带回来；但如果这次读取滞后于那次手动调整，就拿
@@ -585,7 +685,13 @@ class MiMonitorLight:
                     error=None,
                 )
                 self._record_success()
+            if self._power_on_when_reachable:
+                self._power_on_when_reachable = False
+                if not self._state.is_on:
+                    should_power = True
         self._notify()
+        if should_power:
+            self.set_power(True)
         return self._state
 
     def _mark_local_write(self) -> None:
@@ -799,8 +905,8 @@ def quick_ping(ip: str, token: str, timeout: float = 3.0) -> tuple[bool, str, in
         dev.timeout = timeout
         info = dev.info()
         device_id = _extract_device_id(dev)
-        return True, f"Connected: {info.model} (firmware {info.firmware_version})", device_id
+        return True, t("Connected: {0} (firmware {1})", info.model, info.firmware_version), device_id
     except DeviceException as exc:
-        return False, f"miio error: {exc}", 0
+        return False, t("Connection error: {0}", exc), 0
     except Exception as exc:  # noqa: BLE001 - surface anything else to the user
-        return False, f"{type(exc).__name__}: {exc}", 0
+        return False, t("Connection error: {0}", f"{type(exc).__name__}: {exc}"), 0

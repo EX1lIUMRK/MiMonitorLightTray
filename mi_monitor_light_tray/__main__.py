@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from .i18n import LANGUAGES, set_language, t
+from .redact import install_log_redaction
+
 import argparse
 import logging
 import sys
 import threading
-from tkinter import messagebox
+from typing import TYPE_CHECKING
+
+from . import dialogs as messagebox
 
 from .config import AppConfig
+from .reconnect import plan_light_updates
+
+if TYPE_CHECKING:
+    from .config import DeviceConfig
+    from .miio_client import LightState, MiMonitorLight
 from .single_instance import SingleInstance
 
 log = logging.getLogger("mi_monitor_light_tray")
@@ -40,6 +50,7 @@ class App:
         from .version_checker import VersionChecker
 
         self._config = config
+        self._settings_window = None
         # Dict[device_id, MiMonitorLight] - keyed by DeviceConfig.id
         self._lights: dict[str, MiMonitorLight] = {}
 
@@ -60,7 +71,7 @@ class App:
         first_light = next(iter(self._lights.values()), None)
 
         self._tray = TrayController(
-            title="Mi Monitor Light",
+            title=t('Mi Monitor Light'),
             on_left_click=self._on_tray_click,
             on_open_settings=self._open_settings,
             on_exit=self._on_exit,
@@ -79,6 +90,7 @@ class App:
             version_checker=self._version_checker,
             on_toggle_auto_check_update=self._toggle_auto_check_update,
             get_auto_check_update=lambda: self._config.auto_check_update,
+            on_language_changed=self._request_language_change,
         )
         # Set up state listeners for all lights
         for dev_id, light in self._lights.items():
@@ -188,57 +200,27 @@ class App:
         return 0
 
     def _startup_refresh(self) -> None:
-        """Boot-time compensated refresh — mirrors the system-wake retry rounds.
+        """Connect each saved lamp and keep polling while it does not answer.
 
-        Boot-NIC/dock readiness is unreliable (same reason _on_system_resume
-        runs three staggered rounds). A single t+0 refresh often fails and, on
-        plain boot, nothing ever retries — the cache stays "offline" until the
-        user next opens the flyout. Firing three rounds at +0s/+3s/+8s (like
-        _on_system_resume) keeps the first open showing fresh state centered
-        on the real aggregate on/off.
+        A single failed poll used to be followed by two more overlapping
+        refreshes. Whichever call finished last won, so a later timeout could
+        mark the lamp offline after an earlier read had already succeeded, and
+        then nothing tried again. ``ensure_connected`` retries the configured
+        IP on one chain instead.
         """
         import threading
-        import time
 
-        def _round_once() -> None:
-            for dev_config in self._config.devices:
-                if not dev_config.is_complete():
-                    continue
-                light = self._lights.get(dev_config.id)
-                if not light:
-                    continue
-                if dev_config.power_on_at_startup:
-                    # Startup power-on: re-arms every round so a late-ready NIC
-                    # still gets the light switched on once it becomes reachable.
-                    threading.Thread(
-                        target=self._startup_power_on_one,
-                        args=(dev_config, light),
-                        daemon=True,
-                    ).start()
-                else:
-                    threading.Thread(target=light.refresh, daemon=True).start()
-
-        _round_once()
-
-        def _delayed(delay: float) -> None:
-            time.sleep(delay)
-            _round_once()
-
-        threading.Thread(target=lambda: _delayed(3.0), daemon=True).start()
-        threading.Thread(target=lambda: _delayed(8.0), daemon=True).start()
-
-    def _startup_power_on_one(self, dev_config: "DeviceConfig",
-                              light: "MiMonitorLight") -> None:
-        """Turn one device on at boot: refresh, then enable only if reachable
-        and not already on (avoids re-sending each round once it's lit)."""
-        state = light.refresh()
-        if state.reachable:
-            if not state.is_on:
-                light.set_power(True)
-                log.info("Startup power-on sent to %s", dev_config.name)
-        else:
-            log.info("Skipping startup power-on for %s: device unreachable (%s)",
-                     dev_config.name, state.error)
+        for dev_config in self._config.devices:
+            if not dev_config.is_complete():
+                continue
+            light = self._lights.get(dev_config.id)
+            if light is None:
+                continue
+            threading.Thread(
+                target=light.ensure_connected,
+                kwargs={"power_on": dev_config.power_on_at_startup},
+                daemon=True,
+            ).start()
 
     def _run_shutdown_power_off(self) -> None:
         """Send power-off if configured. Idempotent; safe to call from any thread."""
@@ -572,12 +554,43 @@ class App:
     def _show_settings(self) -> None:
         from .device_list_wizard import DeviceListWizard
 
-        DeviceListWizard(
+        current = self._settings_window
+        if current is not None and current._root.winfo_exists():
+            current._root.deiconify()
+            current._root.lift()
+            return
+        self._settings_window = DeviceListWizard(
             self._config,
             on_saved=self._on_config_saved,
             parent=self._flyout._root,
             on_check_update=self._trigger_check_update,
+            on_language_changed=self._refresh_language,
         )
+
+    def _refresh_language(self, language: str | None = None) -> None:
+        """Refresh visible text without reconnecting or sending power commands."""
+        set_language(self._config.language if language is None else language)
+        self._flyout.rebuild(self._lights, self._config)
+        self._tray.set_title(t('Mi Monitor Light'))
+        self._tray.refresh_language()
+
+    def _request_language_change(self, language: str) -> None:
+        # A tray callback runs outside Tk's main thread.
+        self._flyout._root.after(0, lambda: self._change_language(language))
+
+    def _change_language(self, language: str) -> None:
+        old_language = self._config.language
+        self._config.language = language
+        try:
+            self._config.save()
+        except OSError as exc:
+            self._config.language = old_language
+            messagebox.showerror(t('保存失败'), str(exc), parent=self._flyout._root)
+            return
+        settings = self._settings_window
+        if settings is not None and settings._root.winfo_exists():
+            settings.accept_language(language)
+        self._refresh_language()
 
     def _trigger_check_update(self) -> None:
         """Trigger the same update-check flow as the tray menu."""
@@ -586,29 +599,28 @@ class App:
     def _on_config_saved(self, config: AppConfig) -> None:
         log.info("Config updated; reconnecting to devices")
         self._config = config
+        set_language(config.language)
 
-        # Rebuild lights dict from new device list
-        old_lights = self._lights
-        self._lights = {}
-        for dev_config in config.devices:
-            if not dev_config.is_complete():
-                continue
-            # Reuse existing light if device_id matches (avoids reconnection)
-            existing = old_lights.get(dev_config.id)
-            if existing:
-                self._lights[dev_config.id] = existing
-            else:
-                light = self._build_light(dev_config, self._MiMonitorLight)
-                did = dev_config.id
-                light.set_listener(lambda state, d=did: self._on_state_changed(state, d))
-                self._lights[dev_config.id] = light
+        def _build(dev_config):
+            light = self._build_light(dev_config, self._MiMonitorLight)
+            did = dev_config.id
+            light.set_listener(lambda state, d=did: self._on_state_changed(state, d))
+            return light
+
+        plan = plan_light_updates(self._lights, config.devices, _build)
+        self._lights = plan.lights
+        for old in plan.close:
+            old.close()
+        for light in plan.connect:
+            threading.Thread(target=light.ensure_connected, daemon=True).start()
 
         # Rebuild flyout device sections from new config
         self._flyout.rebuild(self._lights, self._config)
 
         # Update tray
         first_light = next(iter(self._lights.values()), None)
-        self._tray.set_title("Mi Monitor Light")
+        self._tray.set_title(t('Mi Monitor Light'))
+        self._tray.refresh_language()
         if first_light:
             self._tray._light = first_light
 
@@ -616,14 +628,6 @@ class App:
         self._setup_hotkeys()
         # Update monitor/system power listener
         self._restart_power_listener()
-
-        # Trigger a refresh to capture device_id and/or model if missing
-        for dev_config in config.devices:
-            if dev_config.device_id == 0 or not dev_config.model:
-                light = self._lights.get(dev_config.id)
-                if light:
-                    import threading
-                    threading.Thread(target=light.refresh, daemon=True).start()
 
     def _on_exit(self) -> None:
         self._flyout.shutdown()
@@ -633,18 +637,15 @@ class App:
         def show_dialog():
             try:
                 import tkinter as tk
-                from tkinter import messagebox
+                from . import dialogs as messagebox
                 import webbrowser
 
                 # Use existing flyout root for the dialog
                 root = self._flyout._root
 
                 result = messagebox.askyesno(
-                    "发现新版本",
-                    f"检测到新版本 v{update_info['version']}！\n\n"
-                    f"当前版本已过时，是否立即前往下载？\n\n"
-                    f"点击「是」在浏览器打开下载页\n"
-                    f"点击「否」稍后再说（可在托盘菜单中查看）",
+                    t('发现新版本'),
+                    t('检测到新版本 v{0}！\n\n当前版本已过时，是否立即前往下载？\n\n点击「是」在浏览器打开下载页\n点击「否」稍后再说（可在托盘菜单中查看）', update_info['version']),
                     parent=root,
                 )
 
@@ -754,20 +755,24 @@ class App:
 
 
 def _run_setup_only(config: AppConfig) -> int:
-    from .setup_wizard import SetupWizard
+    from .device_list_wizard import DeviceListWizard
 
     saved: dict = {}
 
     def _on_saved(updated: AppConfig) -> None:
         saved["config"] = updated
 
-    wizard = SetupWizard(config, on_saved=_on_saved)
+    wizard = DeviceListWizard(config, on_saved=_on_saved)
     wizard.run()
     return 0 if saved else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mi-monitor-light-tray")
+    parser.add_argument(
+        "--language", choices=list(LANGUAGES),
+        help="UI language: auto (Windows), en (English), ru (Russian), zh (Chinese).",
+    )
     parser.add_argument(
         "--setup",
         action="store_true",
@@ -784,7 +789,20 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    install_log_redaction()
     _quiet_miio_warnings()
+
+    config = AppConfig.load()
+    if config.secrets_need_migration:
+        try:
+            config.save()
+            log.info("Encrypted device tokens in the local config")
+        except OSError:
+            log.exception("Could not encrypt device tokens in the local config")
+    # --language overrides this process only. Tray and Settings persist a choice.
+    if args.language:
+        config.language = args.language
+    set_language(config.language)
 
     # Single-instance check — prevent multiple copies running simultaneously.
     lock = SingleInstance("MiMonitorLightTray")
@@ -792,20 +810,29 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("Another instance is already running")
         try:
             import tkinter as tk
-            from tkinter import messagebox
+            from . import dialogs as messagebox
             root = tk.Tk()
             root.withdraw()
             messagebox.showwarning(
-                "已在运行",
-                "小米显示器挂灯控制程序已经在运行\n\n"
-                "请检查系统托盘（屏幕右下角）查看图标",
+                t('已在运行'),
+                t('小米显示器挂灯控制程序已经在运行\n\n请检查系统托盘（屏幕右下角）查看图标'),
             )
             root.destroy()
         except Exception:
             pass
         return 1
 
-    config = AppConfig.load()
+    if config.tokens_need_reentry:
+        try:
+            messagebox.showwarning(
+                t("Could not decrypt the device token"),
+                t(
+                    "The saved device token cannot be decrypted with this "
+                    "Windows account. Enter the token again."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Could not show token decryption warning")
 
     # Open wizard if no devices configured OR if --setup flag passed
     if args.setup or not config.devices or not any(d.is_complete() for d in config.devices):
@@ -813,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
         if rc != 0:
             return rc
         config = AppConfig.load()
+        set_language(config.language)
         if not config.devices or not any(d.is_complete() for d in config.devices):
             log.error("Setup not completed; exiting.")
             return 1

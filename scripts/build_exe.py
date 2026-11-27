@@ -8,6 +8,7 @@ Run from the project root with the dev/build extras installed:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,24 @@ ROOT = Path(__file__).resolve().parent.parent
 ENTRY = ROOT / "scripts" / "run_app.py"
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
+
+
+def _install_locked_requirements() -> None:
+    """Install the hashed lock so the EXE bundles the audited dependency set."""
+    lock = ROOT / "requirements" / "lock.txt"
+    if not lock.is_file():
+        print("ERROR: requirements/lock.txt is missing.", file=sys.stderr)
+        raise SystemExit(1)
+    if os.environ.get("MMLT_SKIP_LOCK_INSTALL") == "1":
+        print("Skipping lock install (MMLT_SKIP_LOCK_INSTALL=1).")
+        return
+    print("Installing pinned requirements from requirements/lock.txt ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--require-hashes", "-r", str(lock)],
+        cwd=ROOT,
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
 
 
 def _sync_package_metadata() -> None:
@@ -56,6 +75,7 @@ def main() -> int:
         )
         return 1
 
+    _install_locked_requirements()
     _sync_package_metadata()
 
     cmd = [
@@ -74,6 +94,8 @@ def main() -> int:
         # package and bundles every non-Python file.
         "--collect-data",
         "miio",
+        "--copy-metadata",
+        "mi-monitor-light-tray",
         # Hidden imports for token extractor
         "--hidden-import",
         "Crypto.Cipher.ARC4",

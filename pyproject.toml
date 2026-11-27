@@ -4,17 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mi-monitor-light-tray"
-version = "1.5.4"
+version = "1.6.0"
 description = "Twinkle Tray-style Windows tray app for adjusting Xiaomi/Mi monitor light bar brightness and color temperature via python-miio."
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
+requires-python = ">=3.12"
+license = "MIT"
 authors = [{ name = "awakaze" }]
 keywords = ["xiaomi", "mijia", "yeelight", "monitor-light", "tray", "miio", "windows"]
 classifiers = [
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -23,18 +22,20 @@ classifiers = [
 dependencies = [
     "python-miio>=0.5.12",
     "pystray>=0.19.5",
-    "Pillow>=10.0.0",
-    "requests>=2.25.0",
-    "pycryptodome>=3.15.0",
+    "Pillow>=13.0.0",
+    "requests>=2.32.0",
+    "pycryptodome>=3.21.0",
+    "certifi>=2026.10.18",
+    "urllib3>=2.8.0",
 ]
 
 [project.optional-dependencies]
-build = ["pyinstaller>=6.0"]
-dev = ["pytest>=7.0"]
+build = ["pyinstaller>=6.16", "setuptools>=70"]
+dev = ["pytest>=8.3", "bandit>=1.8", "pip-audit>=2.9", "ruff>=0.8"]
 
 [project.urls]
-Homepage = "https://github.com/awakaze/MiMonitorLightTray"
-Issues = "https://github.com/awakaze/MiMonitorLightTray/issues"
+Homepage = "https://github.com/EX1lIUMRK/MiMonitorLightTray"
+Issues = "https://github.com/EX1lIUMRK/MiMonitorLightTray/issues"
 
 [project.scripts]
 mi-monitor-light-tray = "mi_monitor_light_tray.__main__:main"
@@ -44,3 +45,14 @@ mi-monitor-light-tray-gui = "mi_monitor_light_tray.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["mi_monitor_light_tray*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101"]

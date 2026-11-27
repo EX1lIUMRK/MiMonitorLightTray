@@ -507,7 +507,9 @@ class FlyoutWindow:
                              args=(dev_id, light), daemon=True).start()
 
     def _refresh_one(self, device_id: str, light: MiMonitorLight) -> None:
-        state = light.refresh()
+        # Retries while the lamp does not answer, instead of one poll that
+        # leaves the open panel stuck on "offline".
+        state = light.ensure_connected()
         self._root.after(0, lambda s=state, d=device_id: self._apply_state(s, d))
 
     def _on_brightness(self, device_id: str, val: int) -> None:

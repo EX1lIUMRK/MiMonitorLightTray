@@ -378,6 +378,13 @@ class MiMonitorLight:
         self._local_write_guard = False
         self._last_error_log = 0.0
         self._discovery_in_progress = False
+        # One retry chain after a failed poll. Overlapping refreshes used to
+        # let a later timeout wipe a status that had already succeeded, then
+        # stop, so a new lamp stayed "offline" until the process was restarted.
+        self._retry_delays: tuple[float, ...] = (1.0, 3.0, 8.0, 15.0, 15.0)
+        self._retries_left = 0
+        self._retry_timer: threading.Timer | None = None
+        self._power_on_when_reachable = False
         self._color_temp_min, self._color_temp_max = self.ct_range_for(self._model)
         # Whether info() has reported a model since this session began. Until
         # then we keep probing on success in case the configured model is wrong
@@ -395,6 +402,18 @@ class MiMonitorLight:
         return self._device_id
 
     @property
+    def ip(self) -> str:
+        return self._ip
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def enable_miot_for_unknown(self) -> bool:
+        return self._enable_miot_for_unknown
+
+    @property
     def model(self) -> str:
         """Return the resolved model id (configured value or device-reported)."""
         return self._model
@@ -409,6 +428,57 @@ class MiMonitorLight:
 
     def set_listener(self, listener: Optional[StateListener]) -> None:
         self._listener = listener
+
+    def close(self) -> None:
+        """Stop reconnect attempts. Used when this lamp is replaced or removed."""
+        with self._lock:
+            self._retries_left = 0
+            self._power_on_when_reachable = False
+            timer = self._retry_timer
+            self._retry_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def ensure_connected(
+        self,
+        *,
+        power_on: bool = False,
+        delays: tuple[float, ...] | None = None,
+    ) -> LightState:
+        """Read status on the configured IP, then retry while it does not answer.
+
+        The configured address is used as-is. UDP rediscovery is a separate
+        path and only runs after a hardware device id is already known, so the
+        first save of a cloud-imported lamp is not blocked on a broadcast.
+        """
+        if delays is not None:
+            self._retry_delays = tuple(delays)
+        with self._lock:
+            if power_on:
+                self._power_on_when_reachable = True
+            self._retries_left = len(self._retry_delays)
+            timer = self._retry_timer
+            self._retry_timer = None
+        if timer is not None:
+            timer.cancel()
+        return self.refresh()
+
+    def _arm_retry(self) -> None:
+        if self._retries_left <= 0 or self._retry_timer is not None:
+            return
+        delay = self._retry_delays[len(self._retry_delays) - self._retries_left]
+        self._retries_left -= 1
+        timer = threading.Timer(delay, self._on_retry)
+        timer.daemon = True
+        self._retry_timer = timer
+        timer.start()
+
+    def _on_retry(self) -> None:
+        with self._lock:
+            self._retry_timer = None
+            if self._state.reachable or self._retries_left < 0:
+                return
+        self.refresh()
 
     def _notify(self) -> None:
         listener = self._listener
@@ -444,6 +514,8 @@ class MiMonitorLight:
             self._last_error_log = now
         self._state.reachable = False
         self._state.error = str(exc)
+        # Keep polling the saved IP. A single timeout must not be the last try.
+        self._arm_retry()
 
         # If we have a device_id and discovery isn't already running, try to find the new IP.
         if (
@@ -580,6 +652,7 @@ class MiMonitorLight:
             self._model_resolved = True
 
     def refresh(self) -> LightState:
+        should_power = False
         with self._lock:
             try:
                 status = self._device.status()
@@ -587,6 +660,11 @@ class MiMonitorLight:
                 self._record_error(exc, "status")
                 self._notify()
                 return self._state
+            self._retries_left = 0
+            timer = self._retry_timer
+            self._retry_timer = None
+            if timer is not None:
+                timer.cancel()
             if self._local_write_guard:
                 # 缓存里是用户刚手动调整的值。灯可能在别处被改过，refresh 仍要
                 # 能把真实状态带回来；但如果这次读取滞后于那次手动调整，就拿
@@ -607,7 +685,13 @@ class MiMonitorLight:
                     error=None,
                 )
                 self._record_success()
+            if self._power_on_when_reachable:
+                self._power_on_when_reachable = False
+                if not self._state.is_on:
+                    should_power = True
         self._notify()
+        if should_power:
+            self.set_power(True)
         return self._state
 
     def _mark_local_write(self) -> None:

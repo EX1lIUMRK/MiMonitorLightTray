@@ -123,15 +123,89 @@ def discover_devices(timeout: float = 5.0) -> list[DiscoveredDevice]:
     return devices
 
 
-def find_device_by_id(target_device_id: int, timeout: float = 5.0) -> Optional[str]:
-    """Discover devices and return the IP of the one matching target_device_id.
+def _is_plausible_device_ipv4(ip: str) -> bool:
+    """Reject addresses that cannot be a lamp we should pin in config."""
+    try:
+        packed = socket.inet_aton(ip)
+    except OSError:
+        return False
+    if ip.count(".") != 3:
+        return False
+    first = packed[0]
+    if ip.startswith("0.") or ip.startswith("127.") or ip == "255.255.255.255":
+        return False
+    # Multicast. A discovery spoof should not be persisted as the device IP.
+    if 224 <= first <= 239:
+        return False
+    return True
 
-    Useful when the device's IP has changed (DHCP reassignment) but you know
-    the device ID from a previous successful connection.
+
+def find_candidate_ips(target_device_id: int, timeout: float = 5.0) -> list[str]:
+    """Return discovery hits for ``target_device_id``.
+
+    The miio discovery packet is unauthenticated. Callers must check the
+    stored token with an authenticated ``info()`` before saving an address.
     """
-    devices = discover_devices(timeout=timeout)
-    for dev in devices:
-        if dev.device_id == target_device_id:
-            log.info("Found target device %08x at new IP %s", target_device_id, dev.ip)
-            return dev.ip
+    if target_device_id <= 0:
+        return []
+    found: list[str] = []
+    for dev in discover_devices(timeout=timeout):
+        if dev.device_id != target_device_id:
+            continue
+        if not _is_plausible_device_ipv4(dev.ip):
+            log.warning("Ignoring implausible discovery address %s", dev.ip)
+            continue
+        if dev.ip not in found:
+            found.append(dev.ip)
+    return found
+
+
+def candidate_is_trusted(
+    *,
+    candidate_ip: str,
+    current_ip: str,
+    authenticated: bool,
+    reported_device_id: int,
+    expected_device_id: int,
+) -> bool:
+    """True only when an authenticated miio call proved this is the same lamp.
+
+    ``authenticated`` means ``info()`` succeeded with the stored token.
+    The device id reported by that handshake must match the one we already
+    trust. A discovery packet alone is not enough.
+    """
+    if not candidate_ip or candidate_ip == current_ip:
+        return False
+    if not _is_plausible_device_ipv4(candidate_ip):
+        return False
+    if not authenticated:
+        return False
+    if expected_device_id <= 0 or reported_device_id != expected_device_id:
+        return False
+    return True
+
+
+def find_device_by_id(
+    target_device_id: int,
+    timeout: float = 5.0,
+    verify=None,
+) -> Optional[str]:
+    """Return a rediscovered IP only after ``verify(ip)`` accepts it.
+
+    ``verify`` must perform an authenticated miio call. Omitting it raises
+    so a bare device-id match cannot be persisted by accident.
+    """
+    if verify is None:
+        raise TypeError(
+            "find_device_by_id requires verify(); refusing an unauthenticated IP match"
+        )
+    for ip in find_candidate_ips(target_device_id, timeout=timeout):
+        try:
+            accepted = bool(verify(ip))
+        except Exception:  # noqa: BLE001
+            log.exception("Discovery verifier failed for %s", ip)
+            continue
+        if accepted:
+            log.info("Found target device %08x at new IP %s", target_device_id, ip)
+            return ip
     return None

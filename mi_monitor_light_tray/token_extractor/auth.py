@@ -2,18 +2,34 @@
 
 from __future__ import annotations
 
+from ..i18n import t
+
 import hashlib
 import logging
 import time
+import urllib.parse
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from ..redact import redact_secrets
 from .core import XiaomiCloudConnector
 from .types import LoginResult, XiaomiDeviceInfo
 
 log = logging.getLogger(__name__)
+
+
+def _is_https(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme == "https" and bool(parsed.hostname)
+
+
+def _debug_response(step: str, text: str) -> None:
+    """Log a short, redacted slice of an account response. Never the raw body."""
+    log.debug("%s response: %s", step, redact_secrets(text)[:200])
 
 
 class XiaomiAuth(ABC):
@@ -56,7 +72,7 @@ class XiaomiAuth(ABC):
                                     "device_info", []
                                 ):
                                     device = XiaomiDeviceInfo(
-                                        name=dev.get("name", "未知设备"),
+                                        name=dev.get("name", t('未知设备')),
                                         did=dev.get("did", ""),
                                         token=dev.get("token", ""),
                                         localip=dev.get("localip", ""),
@@ -115,17 +131,17 @@ class PasswordAuth(XiaomiAuth):
 
         # 步骤1：获取签名
         if not self.login_step_1():
-            return LoginResult(success=False, message="用户名无效")
+            return LoginResult(success=False, message=t('用户名无效'))
 
         # 步骤2：验证密码
         if not self.login_step_2():
-            return LoginResult(success=False, message="用户名或密码错误")
+            return LoginResult(success=False, message=t('用户名或密码错误'))
 
         # 步骤3：获取 service token
         if self._location and not self._connector._service_token:
             if not self.login_step_3():
                 return LoginResult(
-                    success=False, message="无法获取 service token"
+                    success=False, message=t('无法获取 service token')
                 )
 
         # 设置连接器会话数据
@@ -137,7 +153,7 @@ class PasswordAuth(XiaomiAuth):
             )
             return LoginResult(
                 success=True,
-                message="登录成功",
+                message=t('登录成功'),
                 session_data={
                     "ssecurity": self._ssecurity,
                     "service_token": self._connector._service_token,
@@ -145,7 +161,7 @@ class PasswordAuth(XiaomiAuth):
                 },
             )
 
-        return LoginResult(success=False, message="登录失败")
+        return LoginResult(success=False, message=t('登录失败'))
 
     def login_step_1(self) -> bool:
         """步骤1：获取签名。
@@ -161,7 +177,7 @@ class PasswordAuth(XiaomiAuth):
         }
         cookies = {"userId": self._username}
         response = self._session.get(url, headers=headers, cookies=cookies, timeout=10)
-        log.debug("login_step_1 response: %s", response.text[:200])
+        _debug_response("login_step_1", response.text)
 
         if response.status_code == 200:
             json_resp = XiaomiCloudConnector.to_json(response.text)
@@ -192,7 +208,8 @@ class PasswordAuth(XiaomiAuth):
         }
         fields = {
             "sid": "xiaomiio",
-            "hash": hashlib.md5(self._password.encode()).hexdigest().upper(),
+            # Xiaomi's account API requires this MD5; it is not a password store.
+            "hash": hashlib.md5(self._password.encode()).hexdigest().upper(),  # nosec
             "callback": "https://sts.api.io.mi.com/sts",
             "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
             "user": self._username,
@@ -203,7 +220,7 @@ class PasswordAuth(XiaomiAuth):
         response = self._session.post(
             url, headers=headers, params=fields, allow_redirects=False, timeout=10
         )
-        log.debug("login_step_2 response: %s", response.text[:200])
+        _debug_response("login_step_2", response.text)
 
         if response is not None and response.status_code == 200:
             json_resp = XiaomiCloudConnector.to_json(response.text)
@@ -229,6 +246,9 @@ class PasswordAuth(XiaomiAuth):
             是否成功
         """
         log.debug("login_step_3")
+        if not _is_https(self._location):
+            log.warning("Refusing non-HTTPS service-token URL")
+            return False
         headers = {
             "User-Agent": self._connector._agent,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -263,16 +283,16 @@ class QrCodeAuth(XiaomiAuth):
 
         # 步骤1：获取登录 URL
         if not self.login_step_1():
-            return LoginResult(success=False, message="无法获取登录信息")
+            return LoginResult(success=False, message=t('无法获取登录信息'))
 
         # 步骤2：获取二维码图像
         qr_image_data = self.login_step_2()
         if qr_image_data is None:
-            return LoginResult(success=False, message="无法获取二维码图像")
+            return LoginResult(success=False, message=t('无法获取二维码图像'))
 
         return LoginResult(
             success=True,
-            message="请扫描二维码登录",
+            message=t('请扫描二维码登录'),
             qr_image_data=qr_image_data,
             session_data={
                 "login_url": self._login_url,
@@ -301,14 +321,20 @@ class QrCodeAuth(XiaomiAuth):
         }
 
         response = self._session.get(url, params=data, timeout=10)
-        log.debug("login_step_1 response: %s", response.text[:200])
+        _debug_response("qr_login_step_1", response.text)
 
         if response.status_code == 200:
             response_data = XiaomiCloudConnector.to_json(response.text)
             if "qr" in response_data:
-                self._qr_image_url = response_data["qr"]
-                self._login_url = response_data["loginUrl"]
-                self._long_polling_url = response_data["lp"]
+                qr_url = response_data["qr"]
+                login_url = response_data.get("loginUrl")
+                long_poll = response_data.get("lp")
+                if not (_is_https(qr_url) and _is_https(login_url) and _is_https(long_poll)):
+                    log.warning("Refusing Xiaomi login URLs that are not HTTPS")
+                    return False
+                self._qr_image_url = qr_url
+                self._login_url = login_url
+                self._long_polling_url = long_poll
                 self._timeout = int(response_data.get("timeout", 300))
                 return True
         return False
@@ -320,7 +346,8 @@ class QrCodeAuth(XiaomiAuth):
             二维码图像数据，失败返回 None
         """
         log.debug("login_step_2")
-        if not self._qr_image_url:
+        if not _is_https(self._qr_image_url):
+            log.warning("Refusing non-HTTPS QR image URL")
             return None
 
         response = self._session.get(self._qr_image_url, timeout=10)
@@ -335,8 +362,8 @@ class QrCodeAuth(XiaomiAuth):
             登录结果
         """
         log.debug("等待扫码...")
-        if not self._long_polling_url:
-            return LoginResult(success=False, message="未初始化")
+        if not _is_https(self._long_polling_url):
+            return LoginResult(success=False, message=t('未初始化'))
 
         start_time = time.time()
         while True:
@@ -346,10 +373,10 @@ class QrCodeAuth(XiaomiAuth):
                 )
             except requests.exceptions.Timeout:
                 if time.time() - start_time > self._timeout:
-                    return LoginResult(success=False, message="二维码已过期")
+                    return LoginResult(success=False, message=t('二维码已过期'))
                 continue
             except requests.exceptions.RequestException as e:
-                return LoginResult(success=False, message=f"网络错误: {e}")
+                return LoginResult(success=False, message=t('网络错误: {0}', e))
 
             if response.status_code == 200:
                 response_data = XiaomiCloudConnector.to_json(response.text)
@@ -358,6 +385,9 @@ class QrCodeAuth(XiaomiAuth):
                 location = response_data.get("location")
 
                 if location:
+                    if not _is_https(location):
+                        log.warning("Refusing non-HTTPS service-token URL")
+                        return LoginResult(success=False, message=t('登录失败'))
                     # 获取 service token
                     resp = self._session.get(
                         location,
@@ -373,16 +403,16 @@ class QrCodeAuth(XiaomiAuth):
                         if self._connector._service_token:
                             return LoginResult(
                                 success=True,
-                                message="登录成功",
+                                message=t('登录成功'),
                                 session_data={
                                     "ssecurity": self._connector._ssecurity,
                                     "service_token": self._connector._service_token,
                                     "user_id": self._connector._user_id,
                                 },
                             )
-                return LoginResult(success=False, message="登录失败")
+                return LoginResult(success=False, message=t('登录失败'))
             else:
                 return LoginResult(
                     success=False,
-                    message=f"轮询失败: {response.status_code}",
+                    message=t('轮询失败: {0}', response.status_code),
                 )

@@ -15,6 +15,8 @@ the ``_Backend`` abstraction hides that difference from ``MiMonitorLight``.
 
 from __future__ import annotations
 
+from .i18n import t
+
 import logging
 import threading
 import time
@@ -455,11 +457,32 @@ class MiMonitorLight:
     def _try_rediscover(self) -> None:
         self._discovery_in_progress = True
         try:
-            from .discovery import find_device_by_id
+            from .discovery import candidate_is_trusted, find_candidate_ips
 
-            new_ip = find_device_by_id(self._device_id, timeout=6.0)
-            if new_ip and new_ip != self._ip:
-                log.info("Device found at new IP: %s (was %s)", new_ip, self._ip)
+            candidates = find_candidate_ips(self._device_id, timeout=6.0)
+            for new_ip in candidates[:8]:
+                if new_ip == self._ip:
+                    continue
+                try:
+                    ok, _message, reported_id = quick_ping(new_ip, self._token, timeout=3.0)
+                except Exception:  # noqa: BLE001
+                    log.exception("Authenticated probe failed for %s", new_ip)
+                    continue
+                if not candidate_is_trusted(
+                    candidate_ip=new_ip,
+                    current_ip=self._ip,
+                    authenticated=ok,
+                    reported_device_id=reported_id,
+                    expected_device_id=self._device_id,
+                ):
+                    log.warning(
+                        "Ignoring discovered address %s for device %08x; "
+                        "authenticated check did not match",
+                        new_ip,
+                        self._device_id,
+                    )
+                    continue
+                log.info("Device authenticated at new IP %s (was %s)", new_ip, self._ip)
                 self._ip = new_ip
                 with self._lock:
                     self._device = _make_backend(
@@ -468,12 +491,11 @@ class MiMonitorLight:
                     )
                 if self._on_ip_changed:
                     self._on_ip_changed(new_ip)
-                # Retry status immediately.
                 self.refresh()
-            else:
-                log.warning("Auto-discovery did not find device %08x", self._device_id)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Auto-discovery failed: %s", exc)
+                return
+            log.warning("Auto-discovery did not authenticate device %08x", self._device_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Auto-discovery failed")
         finally:
             self._discovery_in_progress = False
 
@@ -799,8 +821,8 @@ def quick_ping(ip: str, token: str, timeout: float = 3.0) -> tuple[bool, str, in
         dev.timeout = timeout
         info = dev.info()
         device_id = _extract_device_id(dev)
-        return True, f"Connected: {info.model} (firmware {info.firmware_version})", device_id
+        return True, t("Connected: {0} (firmware {1})", info.model, info.firmware_version), device_id
     except DeviceException as exc:
-        return False, f"miio error: {exc}", 0
+        return False, t("Connection error: {0}", exc), 0
     except Exception as exc:  # noqa: BLE001 - surface anything else to the user
-        return False, f"{type(exc).__name__}: {exc}", 0
+        return False, t("Connection error: {0}", f"{type(exc).__name__}: {exc}"), 0

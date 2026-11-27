@@ -1,15 +1,26 @@
-"""GitHub Release version checker for automatic update notifications."""
+"""GitHub Release version checker for automatic update notifications.
+
+The checker only reads the public releases API and returns a browser URL.
+It does not download or run an executable.
+"""
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
+import urllib.parse
 from typing import Optional, Tuple
 from pathlib import Path
 
 import requests
 
 log = logging.getLogger(__name__)
+
+# This fork publishes its own builds. Notifications point here, not upstream.
+PROJECT_REPO = "EX1lIUMRK/MiMonitorLightTray"
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_HOSTS = {"github.com", "www.github.com"}
 
 
 def get_current_version() -> str:
@@ -81,95 +92,111 @@ def parse_version(version_str: str) -> Tuple[int, ...]:
     Returns:
         Tuple like (1, 3, 2)
     """
-    # Remove 'v' prefix if present
-    version_str = version_str.lstrip("v")
-
+    version_str = version_str.strip().lstrip("v")
+    parts: list[int] = []
     try:
-        parts = version_str.split(".")
-        return tuple(int(p) for p in parts)
+        for part in version_str.split("."):
+            digits = ""
+            for char in part:
+                if char.isdigit():
+                    digits += char
+                else:
+                    break
+            if not digits:
+                break
+            parts.append(int(digits))
     except (ValueError, AttributeError):
         return (0,)
+    return tuple(parts) or (0,)
+
+
+def release_page_url(url: str, repo: str = PROJECT_REPO) -> Optional[str]:
+    """Return a https GitHub release page, or None if ``url`` is not one."""
+    if not _REPO_RE.fullmatch(repo):
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in _GITHUB_HOSTS:
+        return None
+    prefix = f"/{repo}"
+    if parsed.path != prefix and not parsed.path.startswith(prefix + "/"):
+        return None
+    return urllib.parse.urlunparse(parsed._replace(query="", fragment=""))
 
 
 def check_for_updates(
-    repo: str = "awakaze/MiMonitorLightTray",
-    timeout: int = 5
+    repo: str = PROJECT_REPO,
+    timeout: float = 5,
 ) -> Optional[dict]:
-    """Check GitHub Releases for newer versions.
+    """Check GitHub Releases for a newer version and return a browser link.
 
-    Args:
-        repo: GitHub repository in format "owner/repo"
-        timeout: Request timeout in seconds
-
-    Returns:
-        Dict with update info if newer version available, None otherwise.
-        Format: {"version": "1.4.0", "url": "https://...", "body": "..."}
+    The response is notify-only: no asset is downloaded and nothing is executed.
+    Redirects are refused so the request cannot leave api.github.com.
     """
-    current_version = get_current_version()
+    if not _REPO_RE.fullmatch(repo):
+        log.warning("Refusing update check for unexpected repository name")
+        return None
 
+    current_version = get_current_version()
     if current_version == "unknown":
         log.warning("Cannot determine current version, skipping update check")
         return None
 
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "MiMonitorLightTray",
+    }
     try:
-        url = f"https://api.github.com/repos/{repo}/releases/latest"
-        headers = {"Accept": "application/vnd.github.v3+json"}
-
-        response = requests.get(url, headers=headers, timeout=timeout)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=(3.05, timeout),
+            allow_redirects=False,
+            verify=True,
+        )
+        if response.is_redirect or response.status_code in {301, 302, 303, 307, 308}:
+            log.warning("Update check refused a redirect")
+            return None
         response.raise_for_status()
-
         data = response.json()
-        latest_version = data.get("tag_name", "").lstrip("v")
-
+        if not isinstance(data, dict):
+            log.warning("Update check got an unexpected response")
+            return None
+        latest_version = str(data.get("tag_name") or "").lstrip("v")
         if not latest_version:
             log.debug("No release version found in API response")
             return None
 
-        # Compare versions
         current_tuple = parse_version(current_version)
         latest_tuple = parse_version(latest_version)
-
-        if latest_tuple > current_tuple:
-            log.info("Update available: %s -> %s", current_version, latest_version)
-            return {
-                "version": latest_version,
-                "url": data.get("html_url", ""),
-                "body": data.get("body", ""),
-                "download_url": _extract_exe_url(data),
-            }
-        else:
+        if latest_tuple <= current_tuple:
             log.debug("Already on latest version: %s", current_version)
             return None
 
+        page = release_page_url(str(data.get("html_url") or ""), repo)
+        if page is None:
+            page = f"https://github.com/{repo}/releases/latest"
+        log.info("Update available: %s -> %s", current_version, latest_version)
+        body = data.get("body") or ""
+        if not isinstance(body, str):
+            body = ""
+        return {
+            "version": latest_version,
+            "url": page,
+            "body": body[:4000],
+        }
     except requests.RequestException as exc:
         log.debug("GitHub API request failed: %s", exc)
         return None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Update check failed: %s", exc)
         return None
-
-
-def _extract_exe_url(release_data: dict) -> Optional[str]:
-    """Extract the .exe download URL from release assets.
-
-    Args:
-        release_data: GitHub release API response
-
-    Returns:
-        Download URL for .exe file, or None if not found
-    """
-    assets = release_data.get("assets", [])
-    for asset in assets:
-        name = asset.get("name", "")
-        if name.endswith(".exe"):
-            return asset.get("browser_download_url")
-    return None
 
 
 class VersionChecker:
     """Background version checker that runs on a separate thread."""
 
-    def __init__(self, repo: str = "awakaze/MiMonitorLightTray"):
+    def __init__(self, repo: str = PROJECT_REPO):
         self.repo = repo
         self._update_info: Optional[dict] = None
         self._checked = False

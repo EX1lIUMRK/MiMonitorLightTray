@@ -103,12 +103,24 @@ def test_config_file_is_not_world_readable(tmp_path: Path):
     path = tmp_path / "config.json"
     AppConfig(devices=[DeviceConfig(id="lamp", ip="192.0.2.10", token="ab" * 16)]).save(path)
     if sys.platform == "win32":
+        import re
+
         from mi_monitor_light_tray.secret_store import _current_user_sid, file_dacl_sddl
 
         sddl = file_dacl_sddl(path).upper()
-        assert _current_user_sid().upper() in sddl
-        # Everyone, Authenticated Users, and Builtin Users must not have an ACE.
-        for world in (";WD)", ";AU)", ";BU)"):
+        sid = _current_user_sid().upper()
+        # Windows prints some accounts as SDDL aliases. RID 500 is LA.
+        accepted = {sid}
+        rid = sid.rsplit("-", 1)[-1]
+        if rid == "500":
+            accepted.add("LA")
+        if rid == "501":
+            accepted.add("LG")
+        trustees = re.findall(r"\((?:[^;]*;){5}([^)]+)\)", sddl)
+        assert trustees, sddl
+        assert set(trustees) <= accepted
+        assert sddl.startswith("D:P")
+        for world in (";WD)", ";AU)", ";BU)", ";BA)", ";AN)"):
             assert world not in sddl
     else:
         mode = stat.S_IMODE(path.stat().st_mode)
